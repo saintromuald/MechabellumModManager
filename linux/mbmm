@@ -1,0 +1,1036 @@
+#!/usr/bin/env python3
+"""mbmm - native Linux client for the Mechabellum mod catalog.
+
+Reimplementation of MechabellumModManager's core for Steam/Proton on Linux:
+catalog browsing, SHA-256 verified downloads, profiles, deployment into the
+game's Mods/Plugins/UserLibs slots, and MelonLoader + .NET 6 provisioning in
+the game's own Proton prefix.
+
+No third-party Python packages are required. The optional GTK4 UI uses
+PyGObject from the system interpreter.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+APP_ID = "669330"
+GAME_DIR_NAME = "Mechabellum"
+GAME_EXE = "Mechabellum.exe"
+GAME_ASSEMBLY = "GameAssembly.dll"
+SLOTS = {
+    "MelonMod": "Mods",
+    "MelonPlugin": "Plugins",
+    "MelonUserLibs": "UserLibs",
+    "MelonUserData": "UserData",
+}
+CATALOG_BASE = os.environ.get(
+    "MBMM_CATALOG_BASE",
+    "https://raw.githubusercontent.com/llxlzx/MechabellumMods/master/",
+)
+if not CATALOG_BASE.endswith("/"):
+    CATALOG_BASE += "/"
+CATALOG_URL = CATALOG_BASE + "catalog.json"
+MELON_API = "https://api.github.com/repos/LavaGang/MelonLoader/releases/latest"
+MELON_FALLBACK = "https://github.com/LavaGang/MelonLoader/releases/latest/download/MelonLoader.x64.zip"
+DOTNET6_URL = "https://aka.ms/dotnet/6.0/windowsdesktop-runtime-win-x64.exe"
+USER_AGENT = "mbmm-linux/1.0 (+https://github.com/saintromuald/MechabellumModManager)"
+
+XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+XDG_DATA = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+CONFIG_DIR = XDG_CONFIG / "mbmm"
+DATA_DIR = XDG_DATA / "mbmm"
+STATE_PATH = CONFIG_DIR / "state.json"
+CATALOG_PATH = DATA_DIR / "catalog.json"
+LIBRARY_DIR = DATA_DIR / "library"
+DEPLOY_PATH = DATA_DIR / "deployed.json"
+MELON_MANIFEST = DATA_DIR / "melonloader.json"
+CACHE_DIR = DATA_DIR / "cache"
+
+
+# --------------------------------------------------------------------------- #
+# small helpers
+# --------------------------------------------------------------------------- #
+
+def say(msg: str = "") -> None:
+    print(msg)
+
+
+def die(msg: str, code: int = 1) -> "NoReturn":
+    print(f"error: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def http_get(url: str) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"HTTP {exc.code} for {url}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"network error for {url}: {exc.reason}") from exc
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def atomic_write(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".mbmm-")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def load_json(path: Path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def save_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def run(cmd: list[str], env: dict | None = None, check: bool = True, quiet: bool = False):
+    if not quiet:
+        print("+", " ".join(cmd))
+    proc = subprocess.run(cmd, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if check and proc.returncode != 0:
+        raise RuntimeError(f"command failed ({proc.returncode}): {' '.join(cmd)}\n{proc.stdout.strip()}")
+    return proc
+
+
+# --------------------------------------------------------------------------- #
+# Steam / Proton / game discovery
+# --------------------------------------------------------------------------- #
+
+def steam_roots() -> list[Path]:
+    cands = [
+        Path(os.environ.get("STEAM_ROOT", "")),
+        Path.home() / ".local/share/Steam",
+        Path.home() / ".steam/steam",
+        Path.home() / ".steam/root",
+    ]
+    seen, out = set(), []
+    for p in cands:
+        if p and p.parts and p.exists():
+            rp = p.resolve()
+            if rp not in seen:
+                seen.add(rp)
+                out.append(rp)
+    return out
+
+
+def library_paths(root: Path) -> list[Path]:
+    libs = [root]
+    vdf = root / "steamapps/libraryfolders.vdf"
+    if vdf.exists():
+        text = vdf.read_text(encoding="utf-8", errors="ignore")
+        for m in re.finditer(r'"path"\s+"([^"]+)"', text):
+            raw = m.group(1).replace("\\\\", "\\")
+            p = Path(raw)
+            if p.exists():
+                libs.append(p)
+    seen, out = set(), []
+    for p in libs:
+        rp = p.resolve()
+        if rp not in seen:
+            seen.add(rp)
+            out.append(rp)
+    return out
+
+
+def find_game() -> Path | None:
+    for root in steam_roots():
+        for lib in library_paths(root):
+            cand = lib / "steamapps/common" / GAME_DIR_NAME
+            if (cand / GAME_EXE).is_file() and (cand / GAME_ASSEMBLY).is_file():
+                return cand
+    return None
+
+
+def find_prefix(game: Path) -> Path | None:
+    for root in steam_roots():
+        for lib in library_paths(root):
+            cand = lib / "steamapps/compatdata" / APP_ID / "pfx"
+            if cand.is_dir():
+                return cand
+    # A prefix for the app may live in a different library than the game.
+    for root in steam_roots():
+        cand = root / "steamapps/compatdata" / APP_ID / "pfx"
+        if cand.is_dir():
+            return cand
+    return None
+
+
+def compat_data(prefix: Path) -> Path:
+    return prefix.parent
+
+
+def compat_tool_name(steam_root: Path) -> str | None:
+    cfg = steam_root / "config/config.vdf"
+    if not cfg.exists():
+        return None
+    text = cfg.read_text(encoding="utf-8", errors="ignore")
+    i = text.find('"CompatToolMapping"')
+    if i < 0:
+        return None
+    seg = text[i:]
+    m = re.search(r'"' + APP_ID + r'"\s*\{[^}]*?"name"\s+"([^"]*)"', seg, re.S)
+    return m.group(1) if m else None
+
+
+def find_proton(game: Path | None) -> tuple[Path, Path] | None:
+    """Return (proton_script, proton_dir)."""
+    roots = steam_roots()
+    names = []
+    for root in roots:
+        name = compat_tool_name(root)
+        if name and name not in names:
+            names.append(name)
+    for n in ("Proton - Experimental", "Proton 10.0", "Proton 9.0"):
+        if n not in names:
+            names.append(n)
+    candidates: list[Path] = []
+    for root in roots:
+        for n in names:
+            candidates.append(root / "steamapps/common" / n)
+        common = root / "steamapps/common"
+        if common.is_dir():
+            candidates.extend(sorted(common.glob("Proton*")))
+            candidates.extend(sorted(common.glob("GE-Proton*")))
+    seen = set()
+    for d in candidates:
+        if d in seen or not d.is_dir():
+            continue
+        seen.add(d)
+        script = d / "proton"
+        if script.is_file():
+            return script, d
+    return None
+
+
+def game_running() -> bool:
+    me = os.getpid()
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit() or int(entry.name) == me:
+            continue
+        try:
+            cmd = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "ignore")
+        except OSError:
+            continue
+        if GAME_EXE.lower() in cmd.lower() and "mbmm" not in cmd:
+            return True
+    return False
+
+
+def proton_env(prefix: Path) -> dict:
+    env = dict(os.environ)
+    env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(steam_roots()[0])
+    env["STEAM_COMPAT_DATA_PATH"] = str(compat_data(prefix))
+    return env
+
+
+# --------------------------------------------------------------------------- #
+# catalog / library
+# --------------------------------------------------------------------------- #
+
+def catalog(update: bool = False) -> dict:
+    if update or not CATALOG_PATH.exists():
+        say("Fetching catalog...")
+        data = http_get(CATALOG_URL)
+        CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CATALOG_PATH.write_bytes(data)
+        save_json(CATALOG_PATH.with_suffix(".meta.json"),
+                  {"fetched_at": datetime.now(timezone.utc).isoformat()})
+    try:
+        return json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        die(f"catalog cache is corrupt ({exc}); run `mbmm catalog --refresh`")
+
+
+def catalog_age() -> str:
+    meta = load_json(CATALOG_PATH.with_suffix(".meta.json"), {})
+    ts = meta.get("fetched_at")
+    if not ts:
+        return "unknown"
+    try:
+        then = datetime.fromisoformat(ts)
+        delta = datetime.now(timezone.utc) - then
+        return f"{int(delta.total_seconds() // 60)} min ago"
+    except ValueError:
+        return ts
+
+
+def removal_index(cat: dict) -> dict[str, set[str]]:
+    """id -> set of sha256 that were removed for fairness."""
+    blob = cat.get("removedSigned") or {}
+    payload = blob.get("payload")
+    if not payload:
+        return {}
+    try:
+        raw = base64.b64decode(payload)
+        data = json.loads(raw.decode("utf-8", "ignore"))
+    except Exception:
+        return {}
+    out: dict[str, set[str]] = {}
+    for item in data.get("removed", []):
+        out.setdefault(item.get("id", ""), set()).update(item.get("sha256", []))
+    return out
+
+
+def localized(mod: dict, field: str, lang: str = "en") -> str:
+    loc = (mod.get("locales") or {})
+    entry = loc.get(lang) or {}
+    if entry.get(field):
+        return entry[field]
+    return mod.get(field) or ""
+
+
+def find_mod(cat: dict, mod_id: str) -> dict:
+    for m in cat.get("mods", []):
+        if m.get("id") == mod_id:
+            return m
+    die(f"no mod with id '{mod_id}' in the catalog")
+
+
+def library_meta(mod_id: str) -> dict:
+    return load_json(LIBRARY_DIR / mod_id / ".meta.json", {})
+
+
+def installed(mod_id: str) -> bool:
+    return (LIBRARY_DIR / mod_id / ".meta.json").exists()
+
+
+def download_mod(mod: dict, force: bool = False) -> Path:
+    mod_id = mod["id"]
+    dest_dir = LIBRARY_DIR / mod_id
+    meta = library_meta(mod_id)
+    if (not force and meta.get("version") == mod.get("version")
+            and meta.get("sha256") == mod.get("sha256")
+            and (dest_dir / Path(mod["file"]).name).exists()):
+        say(f"{mod_id}: already installed ({mod.get('version')})")
+        return dest_dir
+
+    removed = removal_index(catalog())
+    if mod_id in removed and mod.get("sha256") in removed[mod_id]:
+        die(f"{mod_id} was removed from the catalog for match-fairness reasons")
+
+    say(f"{mod_id}: downloading {mod.get('version')} ({mod.get('size', 0)} bytes)")
+    payload = b""
+    parts = mod.get("parts") or []
+    if mod.get("originUrl"):
+        payload = http_get(mod["originUrl"])
+    elif parts:
+        chunks = []
+        for i, part in enumerate(parts):
+            data = http_get(CATALOG_BASE + part["file"])
+            got = sha256_bytes(data)
+            if part.get("sha256") and got != part["sha256"]:
+                die(f"{mod_id}: part {i} hash mismatch")
+            if part.get("size") and len(data) != part["size"]:
+                die(f"{mod_id}: part {i} size mismatch")
+            chunks.append(data)
+            say(f"  part {i + 1}/{len(parts)} ok")
+        payload = b"".join(chunks)
+    else:
+        die(f"{mod_id}: catalog entry has neither parts nor originUrl")
+
+    got = sha256_bytes(payload)
+    if got != mod.get("sha256"):
+        die(f"{mod_id}: final hash mismatch\n  expected {mod.get('sha256')}\n  got      {got}")
+    if mod.get("size") and len(payload) != mod["size"]:
+        die(f"{mod_id}: final size mismatch")
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write(dest_dir / Path(mod["file"]).name, payload)
+
+    bundles = []
+    for bundle in mod.get("bundle") or []:
+        data = http_get(CATALOG_BASE + bundle["file"])
+        if bundle.get("sha256") and sha256_bytes(data) != bundle["sha256"]:
+            die(f"{mod_id}: bundle {bundle['path']} hash mismatch")
+        target = dest_dir / "bundle" / bundle["path"]
+        atomic_write(target, data)
+        bundles.append({"path": bundle["path"], "sha256": sha256_bytes(data),
+                        "size": len(data)})
+
+    meta = {
+        "id": mod_id,
+        "version": mod.get("version"),
+        "sha256": mod.get("sha256"),
+        "file": Path(mod["file"]).name,
+        "type": mod.get("type", "MelonMod"),
+        "bundle": bundles,
+        "installed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    save_json(dest_dir / ".meta.json", meta)
+    say(f"{mod_id}: installed and verified")
+    return dest_dir
+
+
+def remove_mod(mod_id: str) -> None:
+    d = LIBRARY_DIR / mod_id
+    if not d.exists():
+        die(f"{mod_id} is not installed")
+    shutil.rmtree(d)
+    state = load_state()
+    for p in state["profiles"].values():
+        if mod_id in p["mods"]:
+            p["mods"].remove(mod_id)
+    save_state(state)
+    say(f"{mod_id}: removed from library")
+
+
+# --------------------------------------------------------------------------- #
+# profiles / deployment
+# --------------------------------------------------------------------------- #
+
+def load_state() -> dict:
+    state = load_json(STATE_PATH, {})
+    state.setdefault("active", "default")
+    state.setdefault("profiles", {"default": {"mods": []}})
+    state["profiles"].setdefault("default", {"mods": []})
+    return state
+
+
+def save_state(state: dict) -> None:
+    save_json(STATE_PATH, state)
+
+
+def slot_for(mod: dict) -> str:
+    return SLOTS.get(mod.get("type", "MelonMod"), "Mods")
+
+
+def desired_files(state: dict, cat: dict) -> tuple[dict[str, dict], list[str]]:
+    """relative game path -> {id, source, sha256}"""
+    desired: dict[str, dict] = {}
+    missing: list[str] = []
+    active = state["profiles"][state["active"]]["mods"]
+    for mod_id in active:
+        try:
+            mod = find_mod(cat, mod_id)
+        except SystemExit:
+            missing.append(mod_id)
+            continue
+        if not installed(mod_id):
+            missing.append(mod_id)
+            continue
+        meta = library_meta(mod_id)
+        slot = slot_for(mod)
+        if meta.get("type") == "MelonUserData":
+            say(f"warning: {mod_id} deploys UserData; skipped on Linux for safety")
+            continue
+        main_rel = f"{slot}/{meta['file']}"
+        desired[main_rel] = {
+            "id": mod_id,
+            "source": LIBRARY_DIR / mod_id / meta["file"],
+            "sha256": meta["sha256"],
+        }
+        for b in meta.get("bundle", []):
+            rel = f"{slot}/{b['path']}"
+            desired[rel] = {
+                "id": mod_id,
+                "source": LIBRARY_DIR / mod_id / "bundle" / b["path"],
+                "sha256": b["sha256"],
+            }
+    # Reject intra-profile collisions before touching the game.
+    seen: dict[str, str] = {}
+    for rel, info in desired.items():
+        if rel in seen and seen[rel] != info["id"]:
+            die(f"profile collision: {rel} is provided by {seen[rel]} and {info['id']}")
+        seen[rel] = info["id"]
+    return desired, missing
+
+
+def safe_join(root: Path, rel: str) -> Path:
+    rel = rel.replace("\\", "/").lstrip("/")
+    if ".." in Path(rel).parts:
+        die(f"refusing path traversal: {rel}")
+    return root / rel
+
+
+def deploy(force: bool = False, dry_run: bool = False) -> None:
+    game = find_game()
+    if not game:
+        die("Mechabellum not found in any Steam library")
+    cat = catalog()
+    state = load_state()
+    desired, missing = desired_files(state, cat)
+
+    manifest = load_json(DEPLOY_PATH, {"game_path": str(game), "files": {}})
+    if Path(manifest.get("game_path", "")) != game:
+        manifest = {"game_path": str(game), "files": {}}
+    old = manifest.get("files", {})
+
+    deletes = [rel for rel in old if rel not in desired]
+    conflicts: list[str] = []
+    copies: list[tuple[str, Path]] = []
+
+    for rel, info in desired.items():
+        dest = safe_join(game, rel)
+        if dest.exists():
+            current = sha256_file(dest)
+            if current == info["sha256"]:
+                continue  # already correct, adopt
+            if rel not in old and not force:
+                conflicts.append(rel)
+                continue
+        copies.append((rel, info["source"]))
+
+    if conflicts:
+        die("refusing to overwrite files the manager did not deploy (use --force):\n  "
+            + "\n  ".join(conflicts))
+
+    say(f"active profile: {state['active']}")
+    say(f"desired files: {len(desired)}   delete: {len(deletes)}   write: {len(copies)}")
+    if missing:
+        say("warning: enabled but not installed: " + ", ".join(sorted(set(missing))))
+    if dry_run:
+        for rel in deletes:
+            say(f"  delete {rel}")
+        for rel, src in copies:
+            say(f"  write  {rel}  <-  {src}")
+        return
+
+    for rel in deletes:
+        dest = safe_join(game, rel)
+        if dest.is_file():
+            dest.unlink()
+            say(f"  deleted {rel}")
+        parent = dest.parent
+        while parent != game and parent.is_dir() and not any(parent.iterdir()):
+            parent.rmdir()
+            parent = parent.parent
+
+    for rel, src in copies:
+        dest = safe_join(game, rel)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(dest, src.read_bytes())
+        say(f"  wrote {rel}")
+
+    new_files = {}
+    for rel, info in desired.items():
+        new_files[rel] = {"id": info["id"], "sha256": info["sha256"]}
+    save_json(DEPLOY_PATH, {"game_path": str(game), "files": new_files,
+                            "applied_at": datetime.now(timezone.utc).isoformat()})
+    say("deployment complete")
+
+
+# --------------------------------------------------------------------------- #
+# MelonLoader / .NET in the Proton prefix
+# --------------------------------------------------------------------------- #
+
+def dotnet6_ok(prefix: Path) -> bool:
+    base = prefix / "drive_c/Program Files/dotnet/host/fxr"
+    return any(base.glob("6.*/hostfxr.dll"))
+
+
+def melon_version(game: Path) -> str | None:
+    manifest = load_json(MELON_MANIFEST, {})
+    if manifest.get("version") and (game / "version.dll").exists():
+        return manifest["version"]
+    if (game / "version.dll").exists() and (game / "MelonLoader/net6/MelonLoader.dll").exists():
+        log = game / "MelonLoader/Latest.log"
+        if log.exists():
+            m = re.search(r"MelonLoader v([0-9][0-9.]*)",
+                          log.read_text(encoding="utf-8", errors="ignore"))
+            if m:
+                return "v" + m.group(1)
+        return "unknown"
+    return None
+
+
+def ensure_prefix_and_proton() -> tuple[Path, Path, Path]:
+    game = find_game()
+    if not game:
+        die("Mechabellum not found in any Steam library")
+    prefix = find_prefix(game)
+    if not prefix:
+        die("no Proton prefix for app 669330; launch the game once through Steam first")
+    found = find_proton(game)
+    if not found:
+        die("no Proton installation found")
+    proton, _ = found
+    return game, prefix, proton
+
+
+def set_dll_override(prefix: Path, proton: Path) -> None:
+    cmd = [str(proton), "run", "reg", "add", r"HKCU\Software\Wine\DllOverrides",
+           "/v", "version", "/d", "native,builtin", "/f"]
+    proc = run(cmd, env=proton_env(prefix), check=False, quiet=True)
+    if proc.returncode != 0:
+        say("warning: could not set the version.dll override in the prefix")
+
+
+def ensure_dotnet6(prefix: Path, proton: Path) -> None:
+    if dotnet6_ok(prefix):
+        say(".NET 6 Desktop Runtime: present in prefix")
+        return
+    installer = CACHE_DIR / "dotnet6-desktop.exe"
+    if not installer.exists():
+        say("Downloading .NET 6 Desktop Runtime (~55 MB)...")
+        atomic_write(installer, http_get(DOTNET6_URL))
+    say("Installing .NET 6 Desktop Runtime into the Proton prefix...")
+    cmd = [str(proton), "run", str(installer), "/install", "/quiet", "/norestart"]
+    run(cmd, env=proton_env(prefix))
+    if not dotnet6_ok(prefix):
+        die("the .NET 6 installer finished but hostfxr.dll 6.x is still missing")
+    say(".NET 6 Desktop Runtime: installed")
+
+
+def melon_install() -> None:
+    game, prefix, proton = ensure_prefix_and_proton()
+    if game_running():
+        die("Mechabellum is running; close it first")
+    say("Resolving latest MelonLoader...")
+    try:
+        info = json.loads(http_get(MELON_API).decode())
+        tag = info.get("tag_name", "?")
+        assets = {a["name"]: a["browser_download_url"] for a in info.get("assets", [])}
+        url = assets.get("MelonLoader.x64.zip", MELON_FALLBACK)
+    except Exception:
+        tag, url = "latest", MELON_FALLBACK
+    say(f"Downloading MelonLoader {tag}...")
+    data = http_get(url)
+
+    written: list[str] = []
+    with zipfile.ZipFile(__import__("io").BytesIO(data)) as zf:
+        for name in zf.namelist():
+            if name.endswith("/"):
+                continue
+            if name != "version.dll" and not name.startswith("MelonLoader/"):
+                continue
+            target = safe_join(game, name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if (game / name).exists():
+                # keep a copy of files we replace so uninstall stays exact
+                pass
+            atomic_write(target, zf.read(name))
+            written.append(name)
+    save_json(MELON_MANIFEST, {"version": tag, "files": written,
+                               "installed_at": datetime.now(timezone.utc).isoformat()})
+    say(f"MelonLoader {tag}: {len(written)} files written")
+
+    ensure_dotnet6(prefix, proton)
+    set_dll_override(prefix, proton)
+    (game / "Mods").mkdir(exist_ok=True)
+    (game / "Plugins").mkdir(exist_ok=True)
+    say("MelonLoader ready")
+
+
+def melon_remove() -> None:
+    game = find_game()
+    if not game:
+        die("Mechabellum not found")
+    for name in ("version.dll",):
+        p = game / name
+        if p.exists():
+            p.unlink()
+            say(f"removed {name}")
+    d = game / "MelonLoader"
+    if d.exists():
+        shutil.rmtree(d)
+        say("removed MelonLoader/")
+    if MELON_MANIFEST.exists():
+        MELON_MANIFEST.unlink()
+    say("MelonLoader removed; game files are back to stock")
+
+
+def melon_status() -> None:
+    game = find_game()
+    if not game:
+        die("Mechabellum not found")
+    v = melon_version(game)
+    if v:
+        say(f"MelonLoader: {v}")
+    else:
+        say("MelonLoader: not installed")
+    prefix = find_prefix(game)
+    if prefix:
+        say(f".NET 6: {'present' if dotnet6_ok(prefix) else 'missing'}")
+        say(f"prefix: {prefix}")
+    else:
+        say("prefix: not created yet (launch the game once through Steam)")
+
+
+# --------------------------------------------------------------------------- #
+# doctor / launch
+# --------------------------------------------------------------------------- #
+
+def doctor() -> None:
+    game = find_game()
+    say("mbmm doctor")
+    say("-" * 50)
+    say(f"catalog: {CATALOG_PATH if CATALOG_PATH.exists() else 'not fetched'} "
+        f"({catalog_age()})")
+    if not game:
+        say("game: NOT FOUND in Steam libraries")
+        return
+    say(f"game: {game}")
+    state = load_state()
+    active = state["profiles"][state["active"]]["mods"]
+    say(f"active profile: {state['active']} ({len(active)} enabled)")
+    say(f"installed mods: {sum(1 for p in LIBRARY_DIR.glob('*') if p.is_dir())}")
+    manifest = load_json(DEPLOY_PATH, {})
+    say(f"deployed files: {len(manifest.get('files', {}))}")
+    prefix = find_prefix(game)
+    found = find_proton(game)
+    say(f"proton: {found[1].name if found else 'NOT FOUND'}")
+    if prefix:
+        say(f"prefix: {prefix}")
+        say(f".NET 6 Desktop: {'present' if dotnet6_ok(prefix) else 'MISSING'}")
+    else:
+        say("prefix: not created yet (launch once through Steam)")
+    v = melon_version(game)
+    say(f"MelonLoader: {v if v else 'not installed'}")
+    if (game / "version.dll").exists():
+        say("proxy: version.dll present")
+    log = game / "MelonLoader/Latest.log"
+    if log.exists():
+        tail = log.read_text(encoding="utf-8", errors="ignore").strip().splitlines()[-1:]
+        if tail:
+            say(f"last MelonLoader log: {tail[0]}")
+
+
+def launch() -> None:
+    say("Launching Mechabellum through Steam...")
+    subprocess.Popen(["steam", "-applaunch", APP_ID],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+def cmd_list(args) -> None:
+    cat = catalog()
+    state = load_state()
+    enabled = set(state["profiles"][state["active"]]["mods"])
+    rows = []
+    for m in cat.get("mods", []):
+        name = localized(m, "name", args.lang)
+        summary = localized(m, "summary", args.lang)
+        if args.search:
+            q = args.search.lower()
+            if q not in name.lower() and q not in summary.lower() and q not in m["id"]:
+                continue
+        if args.category and m.get("category") != args.category:
+            continue
+        rows.append((m, name, summary))
+    for m, name, summary in rows:
+        mark = "x" if m["id"] in enabled else " "
+        inst = "installed" if installed(m["id"]) else "        "
+        say(f"[{mark}] {m['id']:<18} {m.get('version','?'):<10} {inst}  {name}")
+        if args.verbose:
+            say(f"      {summary}")
+    say(f"\n{len(rows)} mods; profile '{state['active']}'")
+
+
+def cmd_show(args) -> None:
+    mod = find_mod(catalog(), args.id)
+    say(f"{localized(mod,'name',args.lang)}  ({mod['id']})")
+    say(f"author:  {mod.get('author','?')}")
+    say(f"version: {mod.get('version','?')}   category: {mod.get('category','?')}")
+    say(f"type:    {mod.get('type','MelonMod')}")
+    say(f"sha256:  {mod.get('sha256')}")
+    say()
+    say(localized(mod, "summary", args.lang))
+    feedback = mod.get("feedback")
+    if feedback:
+        say(f"\nfeedback: {feedback}")
+
+
+def cmd_install(args) -> None:
+    cat = catalog()
+    for mod_id in args.ids:
+        download_mod(find_mod(cat, mod_id), force=args.force)
+    if not args.no_enable:
+        state = load_state()
+        for mod_id in args.ids:
+            if mod_id not in state["profiles"][state["active"]]["mods"]:
+                state["profiles"][state["active"]]["mods"].append(mod_id)
+        save_state(state)
+        say(f"enabled in profile '{state['active']}'")
+    if not args.no_apply and not args.no_enable:
+        deploy(force=args.force)
+
+
+def cmd_profile(args) -> None:
+    state = load_state()
+    if args.action == "list":
+        for name, p in state["profiles"].items():
+            mark = "*" if name == state["active"] else " "
+            say(f"{mark} {name}: {', '.join(p['mods']) or '(empty)'}")
+        return
+    if args.action == "use":
+        state["profiles"].setdefault(args.name, {"mods": []})
+        state["active"] = args.name
+        save_state(state)
+        say(f"active profile: {args.name}")
+        return
+    if args.action in ("add", "remove"):
+        mod_id = args.name
+        if args.action == "add" and not installed(mod_id):
+            die(f"{mod_id} is not installed (mbmm install {mod_id})")
+        mods = state["profiles"][state["active"]]["mods"]
+        if args.action == "add" and mod_id not in mods:
+            mods.append(mod_id)
+        if args.action == "remove" and mod_id in mods:
+            mods.remove(mod_id)
+        save_state(state)
+        say(f"{args.action}: {mod_id}")
+        return
+    die("unknown profile action")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="mbmm", description="Mechabellum mod manager for Linux/Proton")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("doctor", help="show game/prefix/MelonLoader status")
+    sp.set_defaults(func=lambda a: doctor())
+
+    sp = sub.add_parser("catalog", help="fetch or show the catalog")
+    sp.add_argument("--refresh", action="store_true")
+    sp.set_defaults(func=lambda a: (catalog(a.refresh),
+                                    say(f"catalog: {len(catalog().get('mods', []))} mods, updated {catalog_age()}")))
+
+    sp = sub.add_parser("list", help="list catalog mods")
+    sp.add_argument("-s", "--search")
+    sp.add_argument("-c", "--category")
+    sp.add_argument("-v", "--verbose", action="store_true")
+    sp.add_argument("--lang", default="en")
+    sp.set_defaults(func=cmd_list)
+
+    sp = sub.add_parser("show", help="show one mod")
+    sp.add_argument("id")
+    sp.add_argument("--lang", default="en")
+    sp.set_defaults(func=cmd_show)
+
+    sp = sub.add_parser("install", help="download, verify and enable mods")
+    sp.add_argument("ids", nargs="+")
+    sp.add_argument("--force", action="store_true")
+    sp.add_argument("--no-enable", action="store_true")
+    sp.add_argument("--no-apply", action="store_true")
+    sp.set_defaults(func=cmd_install)
+
+    sp = sub.add_parser("remove", help="remove an installed mod")
+    sp.add_argument("id")
+    sp.set_defaults(func=lambda a: remove_mod(a.id))
+
+    sp = sub.add_parser("profile", help="manage profiles")
+    sp.add_argument("action", choices=["list", "use", "add", "remove"])
+    sp.add_argument("name", nargs="?")
+    sp.set_defaults(func=cmd_profile)
+
+    sp = sub.add_parser("apply", help="sync the active profile into the game")
+    sp.add_argument("--force", action="store_true")
+    sp.add_argument("--dry-run", action="store_true")
+    sp.set_defaults(func=lambda a: deploy(a.force, a.dry_run))
+
+    sp = sub.add_parser("melonloader", help="MelonLoader and .NET provisioning")
+    sp.add_argument("action", choices=["install", "remove", "status"])
+    sp.set_defaults(func=lambda a: {"install": melon_install,
+                                    "remove": melon_remove,
+                                    "status": melon_status}[a.action]())
+
+    sp = sub.add_parser("launch", help="launch the game through Steam")
+    sp.set_defaults(func=lambda a: launch())
+
+    sp = sub.add_parser("gui", help="GTK4 interface")
+    sp.set_defaults(func=lambda a: gui_main())
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    args = build_parser().parse_args(argv)
+    try:
+        args.func(args)
+    except RuntimeError as exc:
+        die(str(exc))
+    except KeyboardInterrupt:
+        die("interrupted", 130)
+
+
+# --------------------------------------------------------------------------- #
+# optional GTK4 front-end
+# --------------------------------------------------------------------------- #
+
+def gui_main() -> None:
+    try:
+        import gi  # noqa: F401
+        gi.require_version("Gtk", "4.0")
+        from gi.repository import Gtk, GLib  # noqa: F401
+    except (ImportError, ValueError):
+        # The mise interpreter usually lacks PyGObject; the system one has it.
+        for alt in ("/usr/bin/python3",):
+            if Path(alt).exists() and os.path.realpath(alt) != os.path.realpath(sys.executable):
+                os.execv(alt, [alt, os.path.abspath(__file__), "gui"])
+        die("GTK4 (python-gobject) is not installed")
+
+    import gi
+    gi.require_version("Gtk", "4.0")
+    from gi.repository import Gtk, GLib
+
+    class Window(Gtk.ApplicationWindow):
+        def __init__(self, app):
+            super().__init__(application=app, title="Mechabellum Mod Manager")
+            self.set_default_size(860, 640)
+            self.state = load_state()
+            self.cat = catalog()
+            self.rows = []
+
+            header = Gtk.HeaderBar()
+            self.set_titlebar(header)
+            refresh = Gtk.Button(label="Refresh")
+            refresh.connect("clicked", self.on_refresh)
+            header.pack_start(refresh)
+            self.apply_btn = Gtk.Button(label="Apply")
+            self.apply_btn.add_css_class("suggested-action")
+            self.apply_btn.connect("clicked", self.on_apply)
+            header.pack_end(self.apply_btn)
+            launch_btn = Gtk.Button(label="Launch")
+            launch_btn.connect("clicked", lambda *_: launch())
+            header.pack_end(launch_btn)
+
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            box.set_margin_top(8); box.set_margin_bottom(8)
+            box.set_margin_start(8); box.set_margin_end(8)
+            self.set_child(box)
+
+            self.status = Gtk.Label(xalign=0)
+            self.status.add_css_class("dim-label")
+            box.append(self.status)
+
+            search = Gtk.SearchEntry(placeholder_text="Filter mods")
+            search.connect("search-changed", self.on_search)
+            box.append(search)
+
+            scroll = Gtk.ScrolledWindow(vexpand=True)
+            self.listbox = Gtk.ListBox()
+            self.listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+            scroll.set_child(self.listbox)
+            box.append(scroll)
+
+            self.rebuild()
+            self.update_status()
+
+        def update_status(self):
+            game = find_game()
+            parts = []
+            if game:
+                v = melon_version(game)
+                parts.append(f"MelonLoader {v}" if v else "MelonLoader missing")
+                prefix = find_prefix(game)
+                if prefix:
+                    parts.append(".NET6 ok" if dotnet6_ok(prefix) else ".NET6 missing")
+            else:
+                parts.append("game not found")
+            parts.append(f"profile: {self.state['active']}")
+            self.status.set_text("  ·  ".join(parts))
+
+        def rebuild(self, query=""):
+            while (child := self.listbox.get_first_child()) is not None:
+                self.listbox.remove(child)
+            enabled = set(self.state["profiles"][self.state["active"]]["mods"])
+            for mod in self.cat.get("mods", []):
+                name = localized(mod, "name")
+                summary = localized(mod, "summary")
+                if query and query.lower() not in (name + summary + mod["id"]).lower():
+                    continue
+                row = Gtk.ListBoxRow()
+                hb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+                hb.set_margin_top(6); hb.set_margin_bottom(6)
+                check = Gtk.CheckButton()
+                check.set_active(mod["id"] in enabled)
+                check.connect("toggled", self.on_toggle, mod["id"])
+                hb.append(check)
+                info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+                title = Gtk.Label(xalign=0, label=f"{name}  ·  {mod.get('version','')}")
+                title.add_css_class("heading")
+                sub = Gtk.Label(xalign=0, wrap=True, label=summary)
+                sub.add_css_class("dim-label")
+                info.append(title); info.append(sub)
+                hb.append(info)
+                row.set_child(hb)
+                self.listbox.append(row)
+
+        def on_toggle(self, check, mod_id):
+            mods = self.state["profiles"][self.state["active"]]["mods"]
+            if check.get_active() and mod_id not in mods:
+                mods.append(mod_id)
+            elif not check.get_active() and mod_id in mods:
+                mods.remove(mod_id)
+            save_state(self.state)
+            self.update_status()
+
+        def on_search(self, entry):
+            self.rebuild(entry.get_text())
+
+        def on_refresh(self, *_):
+            self.cat = catalog(update=True)
+            self.rebuild()
+            self.update_status()
+
+        def on_apply(self, *_):
+            try:
+                deploy()
+                self.update_status()
+                self.toast("Applied")
+            except SystemExit as exc:
+                self.toast(f"Apply failed: {exc}")
+
+        def toast(self, text):
+            dialog = Gtk.AlertDialog(message=text)
+            dialog.show(self)
+
+    class App(Gtk.Application):
+        def __init__(self):
+            super().__init__(application_id="io.github.saintromuald.Mbmm")
+
+        def do_activate(self):
+            win = Window(self)
+            win.present()
+
+    App().run([sys.argv[0]])
+
+
+if __name__ == "__main__":
+    main()
