@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""mb-replay - browse and watch Mechabellum replay archives on Linux.
+
+Companion to mbmm. Works with the mechcore replay corpus
+(qbisi/mechcore-replay): 1,500+ tournament matches downloaded from the
+game's own tournament servers, stored as versioned match documents that
+mechcore's browser player can replay without the matching game build.
+
+  mb-replay sync
+  mb-replay list --date 2026-11-01 --region europe --min-elo 1900
+  mb-replay info 436
+  mb-replay play 436
+  mb-replay random --min-elo 2000
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import random
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+CORPUS_REMOTE = "https://github.com/qbisi/mechcore-replay.git"
+DATA = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "mbmm"
+CORPUS = DATA / "replay-corpus"
+MECHCORE = Path(os.environ.get("MECHCORE_BIN",
+                               Path.home() / "Github/mechcore/target/release/mechcore"))
+
+
+def corpus_root() -> Path:
+    if CORPUS.exists():
+        return CORPUS
+    local = Path.home() / "Github/mechcore-replay"
+    if local.exists():
+        return local
+    sys.exit("no replay corpus; run `mb-replay sync` first")
+
+
+def sync() -> None:
+    DATA.mkdir(parents=True, exist_ok=True)
+    if CORPUS.exists():
+        print(f"+ git -C {CORPUS} pull --ff-only")
+        subprocess.run(["git", "-C", str(CORPUS), "pull", "--ff-only"], check=True)
+    else:
+        print(f"+ git clone --depth 1 {CORPUS_REMOTE} {CORPUS}")
+        subprocess.run(["git", "clone", "--depth", "1", CORPUS_REMOTE, str(CORPUS)], check=True)
+    n = sum(1 for _ in (CORPUS / "tournaments").rglob("*.yaml"))
+    print(f"corpus: {n} tournament matches")
+
+
+def parse_header(path: Path) -> dict:
+    """Parse only the match header; the body is large and irrelevant here."""
+    meta = {"file": path, "date": "", "region": "", "blue": {}, "red": {},
+            "build": "", "map_id": "", "seed": "", "winner": ""}
+    parts = path.parts
+    for i, part in enumerate(parts):
+        if part == "tournaments" and i + 2 < len(parts):
+            m = re.match(r"(\d{4}-\d{2}-\d{2})-(\w+)", parts[i + 1])
+            if m:
+                meta["date"], meta["region"] = m.group(1), m.group(2)
+            meta["battle_id"] = Path(parts[i + 2]).stem
+    side = None
+    with path.open(encoding="utf-8", errors="ignore") as fh:
+        for line in fh:
+            if line.startswith("blue:"):
+                side = "blue"
+            elif line.startswith("red:"):
+                side = "red"
+            elif line.startswith("build:"):
+                meta["build"] = line.split(":", 1)[1].strip()
+            elif line.startswith("map_id:"):
+                meta["map_id"] = line.split(":", 1)[1].strip()
+            elif line.startswith("seed:"):
+                meta["seed"] = line.split(":", 1)[1].strip()
+            elif line.startswith("winner:"):
+                meta["winner"] = line.split(":", 1)[1].strip()
+            elif line.startswith("result:"):
+                side = None
+            elif side and re.match(r"\s+name:", line):
+                meta[side]["name"] = line.split(":", 1)[1].strip().strip('"')
+            elif side and re.match(r"\s+elo_score:", line):
+                try:
+                    meta[side]["elo"] = int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    pass
+            elif line.startswith("offers:") or line.startswith("constructions:"):
+                side = None
+            elif side and line and not line.startswith(" "):
+                side = None
+    return meta
+
+
+def matches(args) -> list[dict]:
+    root = corpus_root() / "tournaments"
+    out = []
+    for path in sorted(root.rglob("*.yaml")):
+        meta = parse_header(path)
+        if args.date and meta["date"] != args.date:
+            continue
+        if args.region and meta["region"] != args.region:
+            continue
+        if args.player:
+            q = args.player.lower()
+            if q not in meta["blue"].get("name", "").lower() and q not in meta["red"].get("name", "").lower():
+                continue
+        if args.min_elo:
+            if max(meta["blue"].get("elo", 0), meta["red"].get("elo", 0)) < args.min_elo:
+                continue
+        out.append(meta)
+    return out
+
+
+def describe(meta: dict) -> str:
+    def side(s):
+        name = s.get("name", "?")
+        elo = f" ({s['elo']})" if s.get("elo") else ""
+        return f"{name}{elo}"
+    return (f"{meta.get('battle_id','?'):>7}  {meta['date']:<10} {meta['region']:<8} "
+            f"{side(meta['blue'])} vs {side(meta['red'])}")
+
+
+def resolve(battle_id: str) -> Path:
+    root = corpus_root()
+    hits = [p for p in root.rglob(f"*{battle_id}*.yaml")
+            if p.parent.name.split("-")[-1] in ("asia", "europe", "americas")]
+    if not hits:
+        sys.exit(f"no match with BattleID {battle_id}")
+    if len(hits) > 1:
+        exact = [p for p in hits if p.stem == battle_id]
+        if len(exact) == 1:
+            return exact[0]
+        sys.exit("ambiguous BattleID; pass the full path:\n  " + "\n  ".join(map(str, hits)))
+    return hits[0]
+
+
+def play(path: Path, extra: list[str]) -> None:
+    if not MECHCORE.is_file():
+        sys.exit(f"mechcore binary not found at {MECHCORE}\n"
+                 "build it with: cargo build --release -p mechcore --no-default-features "
+                 "(in qbisi/mechcore)")
+    print(f"playing {path}")
+    subprocess.run([str(MECHCORE), "play", str(path), *extra], check=True)
+
+
+def cmd_list(args) -> None:
+    rows = matches(args)
+    for m in rows[: args.limit]:
+        print(describe(m))
+    print(f"\n{len(rows)} matches")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(prog="mb-replay")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("sync", help="clone or update the replay corpus")
+    sp.set_defaults(func=lambda a: sync())
+
+    sp = sub.add_parser("list", help="list archived matches")
+    sp.add_argument("--date")
+    sp.add_argument("--region", choices=["asia", "europe", "americas"])
+    sp.add_argument("--player")
+    sp.add_argument("--min-elo", type=int)
+    sp.add_argument("--limit", type=int, default=40)
+    sp.set_defaults(func=cmd_list)
+
+    sp = sub.add_parser("info", help="show one match")
+    sp.add_argument("battle_id")
+    sp.set_defaults(func=lambda a: print_match(resolve(a.battle_id)))
+
+    sp = sub.add_parser("play", help="play a match in the HTML battle player")
+    sp.add_argument("battle_id")
+    sp.add_argument("extra", nargs=argparse.REMAINDER)
+    sp.set_defaults(func=lambda a: play(resolve(a.battle_id), a.extra))
+
+    sp = sub.add_parser("random", help="play a random match")
+    sp.add_argument("--date")
+    sp.add_argument("--region", choices=["asia", "europe", "americas"])
+    sp.add_argument("--player")
+    sp.add_argument("--min-elo", type=int)
+    sp.set_defaults(func=lambda a: play(random.choice(matches(a))["file"], []))
+
+    args = p.parse_args()
+    try:
+        args.func(args)
+    except subprocess.CalledProcessError as exc:
+        sys.exit(exc.returncode)
+
+
+def print_match(path: Path) -> None:
+    m = parse_header(path)
+    print(f"match   {m.get('battle_id','?')}")
+    print(f"file    {path}")
+    print(f"date    {m['date']}  region {m['region']}  build {m['build']}")
+    print(f"map     {m['map_id']}  seed {m['seed']}")
+    for side in ("blue", "red"):
+        s = m[side]
+        print(f"{side:<7} {s.get('name','?')}  elo {s.get('elo','?')}")
+    if m["winner"]:
+        print(f"winner  {m['winner']}")
+
+
+if __name__ == "__main__":
+    main()
