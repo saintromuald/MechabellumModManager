@@ -351,6 +351,8 @@ def download_mod(mod: dict, force: bool = False) -> Path:
     say(f"{mod_id}: downloading {mod.get('version')} ({mod.get('size', 0)} bytes)")
     payload = b""
     parts = mod.get("parts") or []
+    bundle_entries = mod.get("bundle") or []
+    main_bundle = None
     if mod.get("originUrl"):
         payload = http_get(mod["originUrl"])
     elif parts:
@@ -366,7 +368,16 @@ def download_mod(mod: dict, force: bool = False) -> Path:
             say(f"  part {i + 1}/{len(parts)} ok")
         payload = b"".join(chunks)
     else:
-        die(f"{mod_id}: catalog entry has neither parts nor originUrl")
+        # Bundle-only mods ship the main assembly as a bundle entry whose hash
+        # matches the catalog's top-level sha256.
+        for bundle in bundle_entries:
+            if bundle.get("sha256") == mod.get("sha256"):
+                main_bundle = bundle
+                break
+        if not main_bundle:
+            die(f"{mod_id}: catalog entry has no parts, originUrl or matching bundle")
+        payload = http_get(CATALOG_BASE + main_bundle["file"])
+        say(f"  main payload from bundle ok")
 
     got = sha256_bytes(payload)
     if got != mod.get("sha256"):
@@ -378,7 +389,10 @@ def download_mod(mod: dict, force: bool = False) -> Path:
     atomic_write(dest_dir / Path(mod["file"]).name, payload)
 
     bundles = []
-    for bundle in mod.get("bundle") or []:
+    main_name = Path(mod["file"]).name
+    for bundle in bundle_entries:
+        if bundle is main_bundle or bundle.get("path") == main_name:
+            continue
         data = http_get(CATALOG_BASE + bundle["file"])
         if bundle.get("sha256") and sha256_bytes(data) != bundle["sha256"]:
             die(f"{mod_id}: bundle {bundle['path']} hash mismatch")
