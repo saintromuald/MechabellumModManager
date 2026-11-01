@@ -16,6 +16,15 @@ Steam/Proton install instead of requiring Wine.
 ./mbmm gui                    # GTK4 front-end
 ```
 
+For replay archives and the offline battle player, see [REPLAYS.md](REPLAYS.md)
+and the companion `mb-replay` script:
+
+```
+./mb-replay sync
+./mb-replay list --region europe --min-elo 2000
+./mb-replay play 20261101--1714
+```
+
 ## Why a port instead of Wine
 
 The upstream manager is `net8.0-windows` **WPF**. .NET Core WPF renders through
