@@ -75,6 +75,27 @@ needs the game running online; `list` and `download` do not work offline. The
 result is the same `tournaments/<date>-<region>/<BattleID>.yaml` layout, and
 `download --publish` / `publish --source` pushes it to the corpus.
 
+### Exporting into the game's replay folder
+
+`mb-replay export` converts match documents back into native `.grbr` replays
+(the same transcode `mechcore convert --to grbr` performs), keeps a standalone
+copy with an index, and deploys it to the game's replay folder:
+
+```bash
+mb-replay export --top-players 100          # 440 matches, top-100 by corpus Elo
+mb-replay export --min-elo 2000 --region europe
+mb-replay export --date 2026-11-01 --limit 50 --no-deploy
+```
+
+- Standalone archive: `~/.local/share/mbmm/replays/` (`.grbr` + `index.tsv`)
+- In-game: `<game>/ProjectDatas/Replay/`, which is what the official replay
+  list and the `replay-reset` / `replay-tool` mods read.
+- The `.grbr` files also work with the RhinoWaspCult analyzer (drag and drop)
+  and the BigPhysh viewer.
+
+`--top-players N` ranks players by their best Elo **in the corpus**, not the
+global ladder, so it means "top N among the players in these tournaments".
+
 ## 3. Other community replay tools
 
 | Tool | What it does | Link |

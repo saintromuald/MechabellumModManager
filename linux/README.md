@@ -23,6 +23,7 @@ and the companion `mb-replay` script:
 ./mb-replay sync
 ./mb-replay list --region europe --min-elo 2000
 ./mb-replay play 20261101--1714
+./mb-replay export --top-players 100
 ```
 
 ## Why a port instead of Wine
