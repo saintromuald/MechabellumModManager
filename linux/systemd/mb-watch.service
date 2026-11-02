@@ -1,0 +1,10 @@
+[Unit]
+Description=Mechabellum top-player replay/content watch
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/mb-watch run --notify
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Nice=10
+IOSchedulingClass=idle

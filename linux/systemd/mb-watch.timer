@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Mechabellum watch twice daily
+
+[Timer]
+OnCalendar=*-*-* 08,20:00
+Persistent=true
+RandomizedDelaySec=20m
+Unit=mb-watch.service
+
+[Install]
+WantedBy=timers.target
