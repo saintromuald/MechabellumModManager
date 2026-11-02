@@ -26,6 +26,13 @@ and the companion `mb-replay` script:
 ./mb-replay export --top-players 100
 ```
 
+For the twice-daily top-player content watchlist, see [WATCH.md](WATCH.md):
+
+```
+./mb-watch run --notify
+./mb-watch list
+```
+
 ## Why a port instead of Wine
 
 The upstream manager is `net8.0-windows` **WPF**. .NET Core WPF renders through

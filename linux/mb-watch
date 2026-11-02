@@ -1,0 +1,656 @@
+#!/usr/bin/python3
+"""mb-watch - twice-daily watchlist for top-level Mechabellum content.
+
+Sources
+  corpus   qbisi/mechcore-replay, new tournament match documents (Elo >= gate)
+  youtube  tournament/pro searches, filtered by trusted channels, events, pros
+  reddit   r/Mechabellum new posts mentioning pros/tournaments/replays
+  fogmoe   FogMoe/Mechabellum-Replays releases (dormant until assets appear)
+
+Only new items are stored; replays are deduplicated by BattleID and SHA-256.
+Top-player gate defaults to Elo 1800 (roughly the in-game top 200), plus a
+curated pro list. Everything is written to a watchlist and a per-run digest.
+
+  mb-watch run [--notify] [--no-download]
+  mb-watch list [--source S] [--all]
+  mb-watch seen <id|--all>
+  mb-watch sources
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+APP = "mb-watch"
+DATA = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "mbmm"
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "mbmm"
+CONFIG_PATH = CONFIG_DIR / "watch.json"
+DB_PATH = DATA / "watch.db"
+WATCH_DIR = DATA / "watch"
+REPLAY_ARCHIVE = DATA / "replays"
+DIGEST = WATCH_DIR / "digest.md"
+WATCHLIST = WATCH_DIR / "watchlist.md"
+LOG = WATCH_DIR / "run.log"
+
+MECHCORE = Path(os.environ.get("MECHCORE_BIN", Path.home() / "Github/mechcore/target/release/mechcore"))
+YTDLP = shutil.which("yt-dlp") or "/usr/bin/yt-dlp"
+UA = "mb-watch/1.0 (+Mechabellum replay watcher)"
+
+DEFAULTS = {
+    # In-game top 200 is around 1800 MMR; this is the quality gate.
+    "min_elo": 1800,
+    # Extra names that community agrees are top/pros (normalized on use).
+    "extra_pros": [
+        "Mathismight", "Dzemp", "RedScareof94", "Apooche", "Sparty",
+        "Shadoff", "oddz", "Rievin", "Steelsane", "Mondkind",
+        "Boatface Killa", "Cheese Bread", "NAprime625", "IsaaX",
+    ],
+    "trusted_channels": [
+        "oddz", "roosterpb", "apooche", "frost games", "hero ajax",
+        "game advisor", "pinstar", "idlecub", "ajax", "rat",
+        "nightmare's gaming",
+    ],
+    "event_keywords": [
+        "mechacademy", "mmm", "crucible cup", "grand final", "finals",
+        "tournament", "championship", "invitational", "showmatch",
+        "top 200", "top 100", "pro replay", "cast",
+    ],
+    "youtube_queries": [
+        "Mechabellum tournament finals",
+        "Mechabellum grand final",
+        "Mechabellum pro replay",
+        "Mechabellum top 200",
+        "Mechabellum Mechacademy",
+        "Mechabellum Crucible Cup",
+        "Mechabellum cast",
+    ],
+    "min_video_seconds": 480,
+    "youtube_results": 10,
+    "max_age_days": 30,
+    "reddit": True,
+    "youtube": True,
+    "corpus": True,
+    "fogmoe": True,
+}
+
+
+def log(msg: str) -> None:
+    WATCH_DIR.mkdir(parents=True, exist_ok=True)
+    line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    print(line)
+    with LOG.open("a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+
+
+def config() -> dict:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if CONFIG_PATH.exists():
+        try:
+            cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            cfg = {}
+    else:
+        cfg = {}
+    merged = dict(DEFAULTS)
+    merged.update(cfg)
+    if not CONFIG_PATH.exists():
+        CONFIG_PATH.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
+    return merged
+
+
+def db() -> sqlite3.Connection:
+    DATA.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("""CREATE TABLE IF NOT EXISTS items (
+        id TEXT PRIMARY KEY, source TEXT, kind TEXT, title TEXT, url TEXT,
+        author TEXT, published TEXT, score REAL, meta TEXT,
+        status TEXT DEFAULT 'new', first_seen TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS replays (
+        battle_id TEXT PRIMARY KEY, sha256 TEXT, path TEXT,
+        first_seen TEXT, meta TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS seen (
+        id TEXT PRIMARY KEY, first_seen TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS sources (
+        name TEXT PRIMARY KEY, last_check TEXT, last_ok TEXT, last_error TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS runs (
+        ts TEXT, new_replays INTEGER, new_items INTEGER, errors TEXT)""")
+    conn.commit()
+    return conn
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def http(url: str, timeout: int = 30) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def norm(name: str) -> str:
+    name = re.sub(r"^\s*\[[^\]]*\]\s*", "", name or "")
+    name = name.casefold().strip()
+    return re.sub(r"\s+", " ", name)
+
+
+def corpus_repo() -> Path | None:
+    for p in (DATA / "replay-corpus", Path.home() / "Github/mechcore-replay"):
+        if (p / "tournaments").is_dir():
+            return p
+    return None
+
+
+def game_dir() -> Path | None:
+    for root in (Path.home() / ".local/share/Steam", Path.home() / ".steam/steam"):
+        vdf = root / "steamapps/libraryfolders.vdf"
+        libs = [root]
+        if vdf.exists():
+            for m in re.finditer(r'"path"\s+"([^"]+)"', vdf.read_text(errors="ignore")):
+                p = Path(m.group(1).replace("\\\\", "\\"))
+                if p.exists():
+                    libs.append(p)
+        for lib in libs:
+            cand = lib / "steamapps/common/Mechabellum"
+            if (cand / "Mechabellum.exe").is_file():
+                return cand
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# corpus
+# --------------------------------------------------------------------------- #
+
+def parse_header(path: Path) -> dict:
+    meta = {"file": str(path), "date": "", "region": "", "blue": {}, "red": {},
+            "build": "", "map_id": "", "seed": "", "battle_id": path.stem}
+    parts = path.parts
+    for i, part in enumerate(parts):
+        if part == "tournaments" and i + 2 < len(parts):
+            m = re.match(r"(\d{4}-\d{2}-\d{2})-(\w+)", parts[i + 1])
+            if m:
+                meta["date"], meta["region"] = m.group(1), m.group(2)
+            meta["battle_id"] = Path(parts[i + 2]).stem
+    side = None
+    for line in path.open(encoding="utf-8", errors="ignore"):
+        if line.startswith("blue:"):
+            side = "blue"
+        elif line.startswith("red:"):
+            side = "red"
+        elif line.startswith("build:"):
+            meta["build"] = line.split(":", 1)[1].strip()
+        elif line.startswith("map_id:"):
+            meta["map_id"] = line.split(":", 1)[1].strip()
+        elif side and re.match(r"\s+name:", line):
+            meta[side]["name"] = line.split(":", 1)[1].strip().strip('"')
+        elif side and re.match(r"\s+elo_score:", line):
+            try:
+                meta[side]["elo"] = int(line.split(":", 1)[1].strip())
+            except ValueError:
+                pass
+        elif side and line and not line.startswith(" "):
+            side = None
+    return meta
+
+
+def all_players(repo: Path) -> dict[str, int]:
+    best: dict[str, int] = {}
+    for path in (repo / "tournaments").rglob("*.yaml"):
+        m = parse_header(path)
+        for side in ("blue", "red"):
+            name, elo = m[side].get("name"), m[side].get("elo", 0)
+            if name:
+                best[norm(name)] = max(best.get(norm(name), 0), elo)
+    return best
+
+
+def check_corpus(conn, cfg: dict, download: bool) -> tuple[int, list[str]]:
+    repo = corpus_repo()
+    if not repo:
+        raise RuntimeError("corpus not found; run `mb-replay sync` once")
+    errors = []
+    try:
+        subprocess.run(["git", "-C", str(repo), "fetch", "--depth", "1", "origin", "master"],
+                       check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        subprocess.run(["git", "-C", str(repo), "reset", "--hard", "FETCH_HEAD"],
+                       check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    except subprocess.CalledProcessError as exc:
+        errors.append(f"corpus sync: {exc.stderr.decode(errors='ignore')[-200:]}")
+
+    players = all_players(repo)
+    pro_names = {n for n, e in players.items() if e >= cfg["min_elo"]}
+    pro_names |= {norm(x) for x in cfg.get("extra_pros", [])}
+
+    first_run = conn.execute("SELECT 1 FROM sources WHERE name='corpus' AND last_ok IS NOT NULL").fetchone() is None
+    new_replays = 0
+    added = []
+    for path in sorted((repo / "tournaments").rglob("*.yaml")):
+        m = parse_header(path)
+        bid = m["battle_id"]
+        elo = max(m["blue"].get("elo", 0), m["red"].get("elo", 0))
+        qualifies = elo >= cfg["min_elo"] or norm(m["blue"].get("name", "")) in pro_names \
+            or norm(m["red"].get("name", "")) in pro_names
+        seen = conn.execute("SELECT 1 FROM seen WHERE id=?", (bid,)).fetchone()
+        if seen:
+            continue
+        conn.execute("INSERT OR IGNORE INTO seen(id, first_seen) VALUES(?,?)", (bid, now()))
+        if first_run:
+            continue
+        if not qualifies:
+            continue
+
+        title = f"{m['blue'].get('name','?')} vs {m['red'].get('name','?')}"
+        url = f"https://github.com/qbisi/mechcore-replay/blob/master/tournaments/{m['date']}-{m['region']}/{bid}.yaml"
+        item_id = f"corpus:{bid}"
+        added.append((item_id, title, elo))
+        conn.execute(
+            "INSERT OR IGNORE INTO items(id,source,kind,title,url,author,published,score,meta,first_seen) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (item_id, "corpus", "replay", title, url,
+             f"{m['blue'].get('name','?')}, {m['red'].get('name','?')}",
+             f"{m['date']}T00:00:00Z", elo, json.dumps(m, ensure_ascii=False), now()))
+
+        if not download:
+            continue
+        archive = REPLAY_ARCHIVE / f"{bid}.grbr"
+        if archive.exists():
+            sha = __import__("hashlib").sha256(archive.read_bytes()).hexdigest()
+            conn.execute("INSERT OR IGNORE INTO replays(battle_id,sha256,path,first_seen,meta) VALUES(?,?,?,?,?)",
+                         (bid, sha, str(archive), now(), json.dumps(m, ensure_ascii=False)))
+            continue
+        REPLAY_ARCHIVE.mkdir(parents=True, exist_ok=True)
+        proc = subprocess.run([str(MECHCORE), "convert", str(path), "--to", "grbr", str(archive)],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=180)
+        if proc.returncode != 0:
+            errors.append(f"convert {bid}: {proc.stderr.strip()[-160:]}")
+            continue
+        sha = __import__("hashlib").sha256(archive.read_bytes()).hexdigest()
+        conn.execute("INSERT OR IGNORE INTO replays(battle_id,sha256,path,first_seen,meta) VALUES(?,?,?,?,?)",
+                     (bid, sha, str(archive), now(), json.dumps(m, ensure_ascii=False)))
+        g = game_dir()
+        if g:
+            target = g / "ProjectDatas/Replay" / archive.name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                shutil.copy2(archive, target)
+        new_replays += 1
+        log(f"corpus: {bid} {title} (elo {elo})")
+
+    conn.execute("INSERT INTO sources(name,last_check,last_ok,last_error) VALUES('corpus',?,?,?) "
+                 "ON CONFLICT(name) DO UPDATE SET last_check=excluded.last_check, last_ok=excluded.last_ok, last_error=excluded.last_error",
+                 (now(), now(), "; ".join(errors) or None))
+    return new_replays, errors
+
+
+# --------------------------------------------------------------------------- #
+# youtube
+# --------------------------------------------------------------------------- #
+
+def check_youtube(conn, cfg: dict) -> tuple[int, list[str]]:
+    errors, added = [], 0
+    pro_names = [n for n in
+                 {norm(x) for x in cfg.get("extra_pros", [])} |
+                 {n for n, e in all_players(corpus_repo()).items() if e >= cfg["min_elo"]}
+                 if len(n) >= 4]
+    trusted = {norm(x) for x in cfg.get("trusted_channels", [])}
+    events = [e.casefold() for e in cfg.get("event_keywords", [])]
+    cutoff = time.time() - cfg.get("max_age_days", 30) * 86400
+
+    candidates = {}
+    for query in cfg["youtube_queries"]:
+        try:
+            proc = subprocess.run(
+                [YTDLP, f"ytsearch{cfg['youtube_results']}:{query}", "--flat-playlist",
+                 "--dump-json", "--no-warnings", "--ignore-errors"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            errors.append(f"youtube timeout: {query}")
+            continue
+        for line in proc.stdout.splitlines():
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            vid = d.get("id")
+            if not vid or vid in candidates:
+                continue
+            title = d.get("title") or ""
+            channel = d.get("channel") or ""
+            duration = d.get("duration") or 0
+            if duration < cfg["min_video_seconds"]:
+                continue
+            text = f"{title} {channel}".casefold()
+            hits_pro = any(p in text for p in pro_names)
+            hits_event = any(e in text for e in events)
+            hits_channel = norm(channel) in trusted
+            # Strict gate: a known pro/player name or a curated top-level channel.
+            # Event keywords only raise the score, they do not admit unknown channels.
+            if not (hits_pro or hits_channel):
+                continue
+            if "mechabellum" not in text and not hits_event:
+                continue
+            score = 0.0
+            score += 3 if hits_channel else 0
+            score += 3 if hits_event else 0
+            score += 2 if hits_pro else 0
+            score += 1 if "mechabellum" in text else 0
+            score += 1 if duration >= 1200 else 0
+            if score < 3:
+                continue
+            candidates[vid] = {"query": query, "title": title, "channel": channel,
+                               "duration": duration, "score": score}
+
+    # Flat search has no dates; fetch metadata for candidates not checked before.
+    fresh = {vid: c for vid, c in candidates.items()
+             if not conn.execute("SELECT 1 FROM seen WHERE id=?", (f"yt:{vid}",)).fetchone()}
+    from concurrent.futures import ThreadPoolExecutor
+
+    def meta(vid):
+        try:
+            proc = subprocess.run(
+                [YTDLP, "--dump-json", "--no-warnings", "--no-playlist",
+                 f"https://www.youtube.com/watch?v={vid}"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=90)
+            if proc.returncode != 0 or not proc.stdout.strip():
+                return vid, None
+            d = json.loads(proc.stdout.splitlines()[0])
+            ts = d.get("timestamp")
+            if not ts and d.get("upload_date"):
+                ts = int(datetime.strptime(d["upload_date"], "%Y%m%d").timestamp())
+            return vid, (ts, d.get("view_count") or 0)
+        except Exception:  # noqa: BLE001
+            return vid, None
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        fetched = dict(pool.map(meta, fresh))
+
+    for vid, c in fresh.items():
+        conn.execute("INSERT OR IGNORE INTO seen(id, first_seen) VALUES(?,?)", (f"yt:{vid}", now()))
+        got = fetched.get(vid)
+        if not got or not got[0]:
+            continue
+        ts, views = got
+        if ts < cutoff:
+            continue
+        item_id = f"youtube:{vid}"
+        if conn.execute("SELECT 1 FROM items WHERE id=?", (item_id,)).fetchone():
+            continue
+        score = c["score"] + min(2.0, math.log10(max(views, 1))) if views else c["score"]
+        conn.execute(
+            "INSERT OR IGNORE INTO items(id,source,kind,title,url,author,published,score,meta,first_seen) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (item_id, "youtube", "video", c["title"],
+             f"https://www.youtube.com/watch?v={vid}", c["channel"],
+             datetime.fromtimestamp(ts, timezone.utc).isoformat(timespec="seconds"),
+             score, json.dumps({"query": c["query"], "duration": c["duration"], "views": views}), now()))
+        added += 1
+        log(f"youtube: {c['title'][:70]} ({c['channel']})")
+    conn.execute("INSERT INTO sources(name,last_check,last_ok,last_error) VALUES('youtube',?,?,?) "
+                 "ON CONFLICT(name) DO UPDATE SET last_check=excluded.last_check, last_ok=excluded.last_ok, last_error=excluded.last_error",
+                 (now(), now(), "; ".join(errors) or None))
+    return added, errors
+
+
+# --------------------------------------------------------------------------- #
+# reddit
+# --------------------------------------------------------------------------- #
+
+def check_reddit(conn, cfg: dict) -> tuple[int, list[str]]:
+    errors, added = [], 0
+    data = None
+    last_exc = None
+    for attempt in range(3):
+        try:
+            data = http("https://www.reddit.com/r/Mechabellum/new/.rss", timeout=30)
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if isinstance(exc, urllib.error.HTTPError) and exc.code == 429 and attempt < 2:
+                time.sleep(5 * (attempt + 1))
+                continue
+            break
+    try:
+        if data is None:
+            raise last_exc or RuntimeError("no response")
+        root = ET.fromstring(data)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"reddit: {exc}")
+        conn.execute("INSERT INTO sources(name,last_check,last_error) VALUES('reddit',?,?) "
+                     "ON CONFLICT(name) DO UPDATE SET last_check=excluded.last_check, last_error=excluded.last_error",
+                     (now(), str(exc)))
+        return 0, errors
+
+    ns = {"a": "http://www.w3.org/2005/Atom"}
+    pro_names = [n for n in
+                 {norm(x) for x in cfg.get("extra_pros", [])} |
+                 {n for n, e in all_players(corpus_repo()).items() if e >= cfg["min_elo"]}
+                 if len(n) >= 4]
+    events = [e.casefold() for e in cfg.get("event_keywords", [])]
+    for entry in root.findall("a:entry", ns):
+        rid = entry.findtext("a:id", default="", namespaces=ns)
+        title = entry.findtext("a:title", default="", namespaces=ns)
+        content = entry.findtext("a:content", default="", namespaces=ns)
+        link = entry.find("a:link", ns)
+        url = link.get("href") if link is not None else ""
+        published = entry.findtext("a:updated", default="", namespaces=ns)
+        author = entry.findtext("a:author/a:name", default="", namespaces=ns)
+        text = f"{title} {content}".casefold()
+        if not any(k in text for k in ("replay", "vod", "tournament", "cast", "final",
+                                       "mechacademy", "analysis", "gameplay")):
+            continue
+        hits_pro = any(p in text for p in pro_names)
+        hits_event = any(e in text for e in events)
+        if not (hits_pro or hits_event or "replay" in text):
+            continue
+        score = (2 if hits_pro else 0) + (2 if hits_event else 0) + \
+                (1 if "replay" in text else 0) + (1 if "tournament" in text else 0)
+        if score < 3:
+            continue
+        item_id = f"reddit:{rid or url}"
+        if conn.execute("SELECT 1 FROM items WHERE id=?", (item_id,)).fetchone():
+            continue
+        conn.execute(
+            "INSERT OR IGNORE INTO items(id,source,kind,title,url,author,published,score,meta,first_seen) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (item_id, "reddit", "post", title, url, author, published, score,
+             json.dumps({"content": content[:500]}), now()))
+        added += 1
+        log(f"reddit: {title[:70]}")
+    conn.execute("INSERT INTO sources(name,last_check,last_ok,last_error) VALUES('reddit',?,?,?) "
+                 "ON CONFLICT(name) DO UPDATE SET last_check=excluded.last_check, last_ok=excluded.last_ok, last_error=excluded.last_error",
+                 (now(), now(), "; ".join(errors) or None))
+    return added, errors
+
+
+# --------------------------------------------------------------------------- #
+# fogmoe releases (dormant until assets exist)
+# --------------------------------------------------------------------------- #
+
+def check_fogmoe(conn, cfg: dict) -> tuple[int, list[str]]:
+    errors, added = [], 0
+    try:
+        rels = json.loads(http("https://api.github.com/repos/FogMoe/Mechabellum-Replays/releases", 30))
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"fogmoe: {exc}")
+        rels = []
+    for rel in rels if isinstance(rels, list) else []:
+        for asset in rel.get("assets", []):
+            if not asset.get("name", "").endswith(".zip"):
+                continue
+            item_id = f"fogmoe:{asset.get('id')}"
+            if conn.execute("SELECT 1 FROM items WHERE id=?", (item_id,)).fetchone():
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO items(id,source,kind,title,url,author,published,score,meta,first_seen) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (item_id, "fogmoe", "archive", asset["name"], asset.get("browser_download_url"),
+                 "FogMoe/Mechabellum-Replays", rel.get("published_at"), 3,
+                 json.dumps({"release": rel.get("tag_name"), "size": asset.get("size")}), now()))
+            added += 1
+    conn.execute("INSERT INTO sources(name,last_check,last_ok,last_error) VALUES('fogmoe',?,?,?) "
+                 "ON CONFLICT(name) DO UPDATE SET last_check=excluded.last_check, last_ok=excluded.last_ok, last_error=excluded.last_error",
+                 (now(), now(), "; ".join(errors) or None))
+    return added, errors
+
+
+# --------------------------------------------------------------------------- #
+# output
+# --------------------------------------------------------------------------- #
+
+def write_outputs(conn, new_items: list[sqlite3.Row]) -> None:
+    WATCH_DIR.mkdir(parents=True, exist_ok=True)
+    rows = conn.execute("SELECT * FROM items ORDER BY status='new' DESC, score DESC, first_seen DESC").fetchall()
+    with WATCHLIST.open("w", encoding="utf-8") as fh:
+        fh.write("# Mechabellum watchlist\n\n")
+        fh.write("Top-player replays and pro/tournament content. `mb-watch seen <id>` marks watched.\n\n")
+        for r in rows:
+            box = " " if r["status"] == "new" else "x"
+            mark = "" if r["status"] == "new" else " ~~watched~~"
+            fh.write(f"- [{box}] **{r['title']}**  \n")
+            fh.write(f"  `{r['id']}` · {r['source']} · score {r['score']:.1f} · {r['url']}{mark}\n")
+    with DIGEST.open("w", encoding="utf-8") as fh:
+        fh.write(f"# Watch digest — {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n")
+        if not new_items:
+            fh.write("No new qualified items.\n")
+        for r in sorted(new_items, key=lambda x: -x["score"]):
+            fh.write(f"- **{r['title']}** ({r['source']}, score {r['score']:.1f})\n  {r['url']}\n")
+
+
+def notify(new_replays: int, new_items: int) -> None:
+    if not (new_replays or new_items):
+        return
+    body = f"{new_replays} new replay(s), {new_items} new link(s). See {WATCHLIST}"
+    subprocess.run(["notify-send", "Mechabellum watch", body], check=False)
+
+
+def run(args) -> None:
+    cfg = config()
+    WATCH_DIR.mkdir(parents=True, exist_ok=True)
+    conn = db()
+    before = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+    replays, errors = 0, []
+
+    if cfg.get("corpus", True):
+        try:
+            n, errs = check_corpus(conn, cfg, download=not args.no_download)
+            replays += n
+            errors += errs
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"corpus: {exc}")
+            log(f"corpus failed: {exc}")
+    if cfg.get("youtube", True):
+        try:
+            n, errs = check_youtube(conn, cfg)
+            errors += errs
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"youtube: {exc}")
+            log(f"youtube failed: {exc}")
+    if cfg.get("reddit", True):
+        try:
+            n, errs = check_reddit(conn, cfg)
+            errors += errs
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"reddit: {exc}")
+            log(f"reddit failed: {exc}")
+    if cfg.get("fogmoe", True):
+        try:
+            n, errs = check_fogmoe(conn, cfg)
+            errors += errs
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"fogmoe: {exc}")
+
+    conn.commit()
+    after = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat(timespec="seconds")
+    new_items = conn.execute(
+        "SELECT * FROM items WHERE first_seen >= ? ORDER BY score DESC", (cutoff,)).fetchall()
+    write_outputs(conn, new_items)
+    conn.execute("INSERT INTO runs(ts,new_replays,new_items,errors) VALUES(?,?,?,?)",
+                 (now(), replays, max(0, after - before), "; ".join(errors)))
+    conn.commit()
+    log(f"run complete: {replays} replays, {max(0, after - before)} items, {len(errors)} errors")
+    if args.notify:
+        notify(replays, max(0, after - before))
+
+
+def cmd_list(args) -> None:
+    conn = db()
+    q = "SELECT * FROM items"
+    where, params = [], []
+    if args.source:
+        where.append("source=?"); params.append(args.source)
+    if not args.all:
+        where.append("status='new'")
+    if where:
+        q += " WHERE " + " AND ".join(where)
+    q += " ORDER BY score DESC, first_seen DESC LIMIT ?"
+    params.append(args.limit)
+    for r in conn.execute(q, params):
+        print(f"{r['score']:.1f}\t{r['source']}\t{r['title'][:70]}\t{r['url']}")
+
+
+def cmd_seen(args) -> None:
+    conn = db()
+    if args.all:
+        conn.execute("UPDATE items SET status='watched' WHERE status='new'")
+        print("marked all watched")
+    else:
+        for item_id in args.ids:
+            conn.execute("UPDATE items SET status='watched' WHERE id=?", (item_id,))
+        print("marked watched")
+    conn.commit()
+
+
+def cmd_sources(args) -> None:
+    conn = db()
+    for r in conn.execute("SELECT * FROM sources ORDER BY name"):
+        print(f"{r['name']:<8} last_ok={r['last_ok'] or '-'}  error={r['last_error'] or '-'}")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(prog=APP)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("run", help="poll every source once")
+    sp.add_argument("--notify", action="store_true")
+    sp.add_argument("--no-download", action="store_true")
+    sp.set_defaults(func=run)
+
+    sp = sub.add_parser("list", help="list watchlist items")
+    sp.add_argument("--source")
+    sp.add_argument("--all", action="store_true")
+    sp.add_argument("--limit", type=int, default=50)
+    sp.set_defaults(func=cmd_list)
+
+    sp = sub.add_parser("seen", help="mark items watched")
+    sp.add_argument("ids", nargs="*")
+    sp.add_argument("--all", action="store_true")
+    sp.set_defaults(func=cmd_seen)
+
+    sp = sub.add_parser("sources", help="source health")
+    sp.set_defaults(func=cmd_sources)
+
+    args = p.parse_args()
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
