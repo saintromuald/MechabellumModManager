@@ -95,7 +95,7 @@ def parse_header(path: Path) -> dict:
 
 def matches(args) -> list[dict]:
     root = corpus_root() / "tournaments"
-    out = []
+    rows = []
     for path in sorted(root.rglob("*.yaml")):
         meta = parse_header(path)
         if args.date and meta["date"] != args.date:
@@ -109,8 +109,22 @@ def matches(args) -> list[dict]:
         if args.min_elo:
             if max(meta["blue"].get("elo", 0), meta["red"].get("elo", 0)) < args.min_elo:
                 continue
-        out.append(meta)
-    return out
+        rows.append(meta)
+    if getattr(args, "top_players", None):
+        top = {name for name, _ in player_ranking()[: args.top_players]}
+        rows = [m for m in rows if m["blue"].get("name") in top or m["red"].get("name") in top]
+    return rows
+
+
+def player_ranking() -> list[tuple[str, int]]:
+    best: dict[str, int] = {}
+    for path in (corpus_root() / "tournaments").rglob("*.yaml"):
+        meta = parse_header(path)
+        for side in ("blue", "red"):
+            name, elo = meta[side].get("name"), meta[side].get("elo", 0)
+            if name:
+                best[name] = max(best.get(name, 0), elo)
+    return sorted(best.items(), key=lambda x: -x[1])
 
 
 def describe(meta: dict) -> str:
@@ -152,6 +166,92 @@ def cmd_list(args) -> None:
     print(f"\n{len(rows)} matches")
 
 
+def find_game_dir() -> Path | None:
+    roots = [Path.home() / ".local/share/Steam", Path.home() / ".steam/steam"]
+    for root in roots:
+        vdf = root / "steamapps/libraryfolders.vdf"
+        libs = [root]
+        if vdf.exists():
+            for m in re.finditer(r'"path"\s+"([^"]+)"', vdf.read_text(errors="ignore")):
+                p = Path(m.group(1).replace("\\\\", "\\"))
+                if p.exists():
+                    libs.append(p)
+        for lib in libs:
+            cand = lib / "steamapps/common/Mechabellum"
+            if (cand / "Mechabellum.exe").is_file():
+                return cand
+    return None
+
+
+def cmd_export(args) -> None:
+    import shutil
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if not MECHCORE.is_file():
+        sys.exit(f"mechcore binary not found at {MECHCORE}")
+
+    rows = matches(args)
+    rows.sort(key=lambda m: max(m["blue"].get("elo", 0), m["red"].get("elo", 0)), reverse=True)
+    if args.limit:
+        rows = rows[: args.limit]
+    out = Path(args.out).expanduser()
+    out.mkdir(parents=True, exist_ok=True)
+
+    todo = [(m, out / f"{m.get('battle_id', 'match')}.grbr") for m in rows
+            if args.force or not (out / f"{m.get('battle_id', 'match')}.grbr").exists()]
+    print(f"exporting {len(todo)} of {len(rows)} matches to {out}")
+
+    def convert(item):
+        meta, dest = item
+        proc = subprocess.run(
+            [str(MECHCORE), "convert", str(meta["file"]), "--to", "grbr", str(dest)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return meta, dest, proc.returncode, proc.stderr.strip()
+
+    failures, done = [], 0
+    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        futures = [pool.submit(convert, item) for item in todo]
+        for fut in as_completed(futures):
+            meta, dest, code, err = fut.result()
+            done += 1
+            if code != 0:
+                failures.append(meta)
+                print(f"  FAIL {meta.get('battle_id')}: {err.splitlines()[-1] if err else code}")
+            elif done % 25 == 0 or done == len(todo):
+                print(f"  {done}/{len(todo)}")
+
+    index = out / "index.tsv"
+    with index.open("w", encoding="utf-8") as fh:
+        fh.write("battle_id\tdate\tregion\tblue\tblue_elo\tred\tred_elo\tmap\tfile\n")
+        for m in rows:
+            f = m.get("battle_id", "") + ".grbr"
+            if (out / f).exists():
+                fh.write("\t".join(str(x) for x in (
+                    m.get("battle_id", ""), m["date"], m["region"],
+                    m["blue"].get("name", ""), m["blue"].get("elo", ""),
+                    m["red"].get("name", ""), m["red"].get("elo", ""),
+                    m["map_id"], f)) + "\n")
+    print(f"index: {index}")
+    if failures:
+        print(f"failed: {len(failures)}")
+
+    if args.no_deploy:
+        print("not deployed (--no-deploy)")
+        return
+    game = Path(args.game).expanduser() if args.game else find_game_dir()
+    if not game:
+        sys.exit("game folder not found; rerun with --no-deploy or pass --game")
+    replay_dir = game / "ProjectDatas/Replay"
+    replay_dir.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for f in out.glob("*.grbr"):
+        target = replay_dir / f.name
+        if not target.exists() or args.force:
+            shutil.copy2(f, target)
+            n += 1
+    print(f"deployed {n} replays to {replay_dir}")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(prog="mb-replay")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -182,6 +282,20 @@ def main() -> None:
     sp.add_argument("--player")
     sp.add_argument("--min-elo", type=int)
     sp.set_defaults(func=lambda a: play(random.choice(matches(a))["file"], []))
+
+    sp = sub.add_parser("export", help="convert matches to .grbr and deploy to the game")
+    sp.add_argument("--date")
+    sp.add_argument("--region", choices=["asia", "europe", "americas"])
+    sp.add_argument("--player")
+    sp.add_argument("--min-elo", type=int)
+    sp.add_argument("--top-players", type=int)
+    sp.add_argument("--limit", type=int)
+    sp.add_argument("--out", default=str(DATA / "replays"))
+    sp.add_argument("--jobs", type=int, default=8)
+    sp.add_argument("--force", action="store_true")
+    sp.add_argument("--no-deploy", action="store_true")
+    sp.add_argument("--game", help="game root (default: auto-detect)")
+    sp.set_defaults(func=cmd_export)
 
     args = p.parse_args()
     try:
